@@ -1,0 +1,12 @@
+{
+
+  "poll_interval_seconds": 30,
+  "poll_jitter_seconds": 5,
+
+  "discord_webhook": "https://discordapp.com/api/webhooks/1501052533844742366/GzvCLKHR6wFCWIQhNXv-wYeNJYUhBoheFGSWvOTKA9caW5YVk5LG5HuBs4sPQkmwGvDF",
+
+  "ntfy": {
+    "server": "https://ntfy.sh",
+    "topic": "jonas944-pc-tcg"
+  }
+}
