@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Pokemon Center TCG Stock Monitor
+Best Buy Pokemon TCG Stock Monitor
 
-Polls https://www.pokemoncenter.com/category/tcg-cards on a fixed interval,
-detects when a product flips from out-of-stock -> in-stock, and fires
-notifications via Discord webhook and/or ntfy.sh push.
+Polls Best Buy's Pokemon TCG search page on a fixed interval, detects when
+a product flips from out-of-stock -> in-stock, and fires notifications via
+Discord webhook and/or ntfy.sh push.
 
 Usage:
     python monitor.py             # run the monitor loop
     python monitor.py --once      # poll one time and exit (good for cron)
-    python monitor.py --dump      # save the parsed Next.js blob to debug.json and exit
+    python monitor.py --dump      # save raw HTML + parsed data for debugging
     python monitor.py --test      # send test notifications to your configured channels
 
 Config lives in config.json (copy from config.example.json).
@@ -31,11 +31,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import requests
-# curl_cffi mimics a real Chrome TLS fingerprint so Pokemon Center's
-# Imperva bot-detection can't fingerprint us as Python via the TLS handshake.
-# We only use it for fetching the category page; Discord and ntfy don't
-# fingerprint, so we keep regular `requests` for those.
-from curl_cffi import requests as cffi_requests
+# curl_cffi (optional) mimics a real Chrome TLS fingerprint. Best Buy doesn't
+# fingerprint heavily, so plain requests works, but we use curl_cffi when it's
+# installed for defense-in-depth in case anti-bot ever ramps up.
+try:
+    from curl_cffi import requests as cffi_requests  # type: ignore
+    _HAS_CFFI = True
+except ImportError:
+    cffi_requests = None  # type: ignore
+    _HAS_CFFI = False
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -47,8 +51,8 @@ STATE_FILE = SCRIPT_DIR / "stock_state.json"
 LOG_FILE = SCRIPT_DIR / "monitor.log"
 DEBUG_DUMP_FILE = SCRIPT_DIR / "debug.json"
 
-CATEGORY_URL = "https://www.pokemoncenter.com/category/tcg-cards"
-SITE_ROOT = "https://www.pokemoncenter.com"
+CATEGORY_URL = "https://www.bestbuy.com/site/searchpage.jsp?st=pokemon+trading+cards&_dyncharset=UTF-8&id=pcat17071&type=page&sc=Global&cp=1&nrp=24&list=n&iht=y&keys=keys"
+SITE_ROOT = "https://www.bestbuy.com"
 
 # Realistic Chrome-on-Windows headers. Anti-bot systems primarily flag missing
 # or python-default User-Agents, so this matters more than people realize.
@@ -173,10 +177,15 @@ def save_state(state: Dict[str, bool]) -> None:
 # ---------------------------------------------------------------------------
 
 def make_browser_session():
-    """Return a curl_cffi session that impersonates real Chrome at the TLS
-    layer. This is the key piece for getting past Imperva\'s fingerprinting.
+    """Return a session for hitting Best Buy. We try curl_cffi first (in case
+    Best Buy ever ramps up TLS fingerprinting) and fall back to regular requests.
     """
-    return cffi_requests.Session(impersonate="chrome")
+    if _HAS_CFFI:
+        try:
+            return cffi_requests.Session(impersonate="chrome")
+        except Exception:
+            pass
+    return requests.Session()
 
 
 def fetch_page(session) -> Optional[str]:
@@ -187,19 +196,23 @@ def fetch_page(session) -> Optional[str]:
         return None
     if resp.status_code == 200:
         body = resp.text
-        # Imperva\'s challenge page returns 200 OK but contains specific markers.
-        # If we see them, treat as a soft block (the parser would fail anyway).
-        if "Pardon Our Interruption" in body or "distil_referrer" in body:
-            logger.warning("Got Imperva challenge page (TLS fingerprint may need refresh).")
+        # Best Buy occasionally serves a "robot or human?" interstitial. Detect it.
+        low = body[:4000].lower()
+        if "are you a robot" in low or "captcha" in low or "blocked" in low:
+            logger.warning("Got Best Buy bot-challenge interstitial.")
             return None
         return body
     if resp.status_code in (403, 429):
-        logger.warning("Got HTTP %s — likely rate-limited or bot-flagged.", resp.status_code)
+        logger.warning("Got HTTP %s — likely rate-limited.", resp.status_code)
     else:
         logger.warning("Got HTTP %s fetching category page", resp.status_code)
     return None
 
 
+_LD_JSON_RE = re.compile(
+    r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+    re.DOTALL | re.IGNORECASE,
+)
 _NEXT_DATA_RE = re.compile(
     r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',
     re.DOTALL,
@@ -207,31 +220,62 @@ _NEXT_DATA_RE = re.compile(
 
 
 def extract_next_data(html: str) -> Optional[dict]:
-    """Pull the JSON blob out of <script id="__NEXT_DATA__">."""
-    m = _NEXT_DATA_RE.search(html)
-    if not m:
+    """Pull every JSON-bearing script block from the page and bundle into one
+    dict the walker can iterate. Best Buy spreads product data across multiple
+    <script type=\"application/ld+json\"> blocks (one per product), so we
+    collect them all into a list under \"ld_blocks\" plus include the Next.js
+    blob if present.
+    """
+    out: dict = {"ld_blocks": []}
+    for raw in _LD_JSON_RE.findall(html):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        out["ld_blocks"].append(parsed)
+    nm = _NEXT_DATA_RE.search(html)
+    if nm:
+        try:
+            out["next_data"] = json.loads(nm.group(1))
+        except json.JSONDecodeError:
+            pass
+    if not out["ld_blocks"] and "next_data" not in out:
         return None
-    try:
-        return json.loads(m.group(1))
-    except json.JSONDecodeError as e:
-        logger.warning("Failed to parse __NEXT_DATA__: %s", e)
-        return None
+    return out
 
 
 _NAME_KEYS = ("name", "displayName", "title", "productName")
-_SKU_KEYS = ("sku", "productId", "id", "masterId")
-_STOCK_KEYS = ("inStock", "in_stock", "orderable", "available", "isAvailable", "isOrderable")
-_PRICE_KEYS = ("price", "listPrice", "salePrice", "currentPrice")
+_SKU_KEYS = ("skuId", "sku", "productId", "id")
+_STOCK_KEYS = (
+    "inStoreAvailability", "onlineAvailability",
+    "inStock", "in_stock", "orderable", "available", "isAvailable",
+)
+_PRICE_KEYS = ("price", "regularPrice", "currentPrice", "salePrice", "listPrice")
+# JSON-LD availability strings map to in-stock truthiness.
+_LD_AVAIL_INSTOCK = (
+    "instock", "in_stock",
+    "https://schema.org/instock", "http://schema.org/instock",
+    "https://schema.org/limitedavailability", "http://schema.org/limitedavailability",
+    "https://schema.org/onlineonly", "http://schema.org/onlineonly",
+    "https://schema.org/preorder", "http://schema.org/preorder",
+)
 
 
 def _looks_like_product(obj: Any) -> bool:
     if not isinstance(obj, dict):
         return False
+    # JSON-LD Product schema
+    if obj.get("@type") == "Product" and obj.get("name"):
+        return True
     has_sku = any(k in obj for k in _SKU_KEYS)
     has_name = any(k in obj for k in _NAME_KEYS)
     has_stock_signal = (
         any(k in obj for k in _STOCK_KEYS)
         or "availability" in obj
+        or "offers" in obj
         or "inventory" in obj
         or any(k in obj for k in _PRICE_KEYS)
     )
@@ -249,7 +293,12 @@ def _extract_price(raw) -> Optional[str]:
     if raw is None:
         return None
     if isinstance(raw, str):
-        return raw
+        s = raw.strip()
+        # Format bare numeric strings as currency for cleaner alerts.
+        try:
+            return f"${float(s):.2f}"
+        except (TypeError, ValueError):
+            return s
     if isinstance(raw, (int, float)):
         return f"${raw:.2f}"
     if isinstance(raw, dict):
@@ -266,19 +315,42 @@ def _extract_price(raw) -> Optional[str]:
 
 
 def _extract_stock(obj: dict) -> bool:
+    # JSON-LD style: { "offers": { "availability": "https://schema.org/InStock" } }
+    offers = obj.get("offers")
+    if isinstance(offers, dict):
+        av = offers.get("availability")
+        if isinstance(av, str):
+            return av.strip().lower().lstrip("/") in _LD_AVAIL_INSTOCK or av.lower().endswith("instock")
+    if isinstance(offers, list):
+        for o in offers:
+            if isinstance(o, dict):
+                av = o.get("availability")
+                if isinstance(av, str) and (av.strip().lower().lstrip("/") in _LD_AVAIL_INSTOCK or av.lower().endswith("instock")):
+                    return True
+
+    # Best Buy / generic style flat fields
     for k in _STOCK_KEYS:
         if k in obj:
-            return bool(obj[k])
+            v = obj[k]
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.lower() in ("yes", "true", "instock", "in_stock", "available", "orderable")
+
     avail = obj.get("availability") or obj.get("inventory")
     if isinstance(avail, dict):
         for k in _STOCK_KEYS:
             if k in avail:
-                return bool(avail[k])
+                v = avail[k]
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, str):
+                    return v.lower() in ("yes", "true", "instock", "in_stock", "available", "orderable")
         status = avail.get("status") or avail.get("availabilityStatus")
         if isinstance(status, str):
             return status.lower() in ("instock", "in_stock", "available", "orderable")
     if isinstance(avail, str):
-        return avail.lower() in ("instock", "in_stock", "available", "orderable")
+        return avail.strip().lower().lstrip("/") in _LD_AVAIL_INSTOCK or avail.lower() in ("instock", "in_stock", "available", "orderable")
     return False
 
 
@@ -312,14 +384,30 @@ def _build_product(obj: dict) -> Optional[Product]:
     sku_raw = _first(obj, _SKU_KEYS)
     name_raw = _first(obj, _NAME_KEYS)
     if not sku_raw or not name_raw:
-        return None
+        # JSON-LD products can have name without sku — synthesize from URL.
+        if name_raw and obj.get("url"):
+            sku_raw = obj["url"].rstrip("/").split("/")[-1].split(".")[0]
+        else:
+            return None
     sku = str(sku_raw)
     name = str(name_raw)
+    # Price from flat fields OR from offers.price (JSON-LD)
+    price = _extract_price(_first(obj, _PRICE_KEYS))
+    if price is None:
+        offers = obj.get("offers")
+        if isinstance(offers, dict):
+            price = _extract_price(offers.get("price") or offers.get("lowPrice"))
+        elif isinstance(offers, list) and offers:
+            for o in offers:
+                if isinstance(o, dict):
+                    price = _extract_price(o.get("price") or o.get("lowPrice"))
+                    if price:
+                        break
     return Product(
         sku=sku,
         name=name,
         url=_extract_url(obj, sku),
-        price=_extract_price(_first(obj, _PRICE_KEYS)),
+        price=price,
         in_stock=_extract_stock(obj),
         image=_extract_image(obj),
     )
@@ -328,10 +416,10 @@ def _build_product(obj: dict) -> Optional[Product]:
 def parse_products(next_data: dict) -> List[Product]:
     """Walk the entire Next.js data tree and yank anything that looks like a product.
 
-    Pokemon Center occasionally re-shapes their props between deploys, so instead
-    of binding to a specific path (props.pageProps.products[...]) we walk the
-    tree and identify product-shaped objects by their fields. This survives most
-    refactors.
+    Best Buy embeds product data in JSON-LD blocks plus internal Next.js props.
+    Rather than binding to a specific JSON path (which breaks on every redesign)
+    we walk the tree and identify product-shaped objects by their fields. This
+    survives most refactors.
     """
     products: List[Product] = []
     seen: Set[str] = set()
@@ -363,7 +451,7 @@ def send_discord(webhook: str, product: Product) -> bool:
         "url": product.url,
         "color": 0xEE1515,
         "fields": [],
-        "footer": {"text": "Pokemon Center stock monitor"},
+        "footer": {"text": "Best Buy TCG stock monitor"},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     if product.price:
@@ -537,7 +625,7 @@ def cmd_test():
     fake = Product(
         sku="TEST-0001",
         name="[TEST] Surging Sparks Booster Box",
-        url="https://www.pokemoncenter.com/category/tcg-cards",
+        url="https://www.bestbuy.com/site/searchpage.jsp?st=pokemon+trading+cards",
         price="$161.64",
         in_stock=True,
         image=None,
@@ -548,7 +636,7 @@ def cmd_test():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pokemon Center TCG stock monitor")
+    parser = argparse.ArgumentParser(description="Best Buy Pokemon TCG stock monitor")
     parser.add_argument("--once", action="store_true", help="Poll once and exit")
     parser.add_argument("--dump", action="store_true",
                         help="Fetch and dump __NEXT_DATA__ for debugging, then exit")
