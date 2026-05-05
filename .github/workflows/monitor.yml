@@ -29,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Poll Pokemon Center
+      - name: Poll Best Buy
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
