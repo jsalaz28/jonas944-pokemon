@@ -31,6 +31,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import requests
+# curl_cffi mimics a real Chrome TLS fingerprint so Pokemon Center's
+# Imperva bot-detection can't fingerprint us as Python via the TLS handshake.
+# We only use it for fetching the category page; Discord and ntfy don't
+# fingerprint, so we keep regular `requests` for those.
+from curl_cffi import requests as cffi_requests
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -167,14 +172,27 @@ def save_state(state: Dict[str, bool]) -> None:
 # Fetch + parse
 # ---------------------------------------------------------------------------
 
-def fetch_page(session: requests.Session) -> Optional[str]:
+def make_browser_session():
+    """Return a curl_cffi session that impersonates real Chrome at the TLS
+    layer. This is the key piece for getting past Imperva\'s fingerprinting.
+    """
+    return cffi_requests.Session(impersonate="chrome")
+
+
+def fetch_page(session) -> Optional[str]:
     try:
         resp = session.get(CATEGORY_URL, headers=DEFAULT_HEADERS, timeout=20)
-    except requests.RequestException as e:
+    except Exception as e:
         logger.warning("Fetch error: %s", e)
         return None
     if resp.status_code == 200:
-        return resp.text
+        body = resp.text
+        # Imperva\'s challenge page returns 200 OK but contains specific markers.
+        # If we see them, treat as a soft block (the parser would fail anyway).
+        if "Pardon Our Interruption" in body or "distil_referrer" in body:
+            logger.warning("Got Imperva challenge page (TLS fingerprint may need refresh).")
+            return None
+        return body
     if resp.status_code in (403, 429):
         logger.warning("Got HTTP %s — likely rate-limited or bot-flagged.", resp.status_code)
     else:
@@ -465,7 +483,7 @@ def run_loop():
     interval = int(config.get("poll_interval_seconds", 30))
     jitter = int(config.get("poll_jitter_seconds", 5))
 
-    session = requests.Session()
+    session = make_browser_session()
     logger.info("Starting monitor — polling every %ds (+/-%ds jitter)", interval, jitter)
     logger.info("Tracking %d previously-seen products", len(state))
 
@@ -489,7 +507,7 @@ def cmd_dump():
     """Fetch the page once and write the parsed __NEXT_DATA__ to debug.json
     plus a list of detected products. Useful when parse_products() returns 0
     and we need to retune the field names."""
-    session = requests.Session()
+    session = make_browser_session()
     html = fetch_page(session)
     if not html:
         print("Fetch failed.")
@@ -547,7 +565,7 @@ def main():
     if args.once:
         config = load_config()
         state = load_state()
-        session = requests.Session()
+        session = make_browser_session()
         poll_once(session, state, config)
         return
 
